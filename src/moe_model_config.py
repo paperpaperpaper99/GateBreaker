@@ -87,13 +87,5 @@ models = {
         num_router_expert=64,
         name_router_expert="mlp.experts",
         name_expert_layers=["gate_proj", "up_proj"],
-        name_shared_expert="mlp.shared_expert"),
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct": MoEModelConfig(
-        model_name="Llama-4-Scout-17B-16E-Instruct", 
-        name_gate="feed_forward.router", 
-        topk=1, 
-        num_router_expert=16,
-        name_router_expert="feed_forward.experts",
-        name_expert_layers=["gate_proj", "up_proj"],
-        name_shared_expert="feed_forward.shared_expert"),
+        name_shared_expert="mlp.shared_expert")
 }
