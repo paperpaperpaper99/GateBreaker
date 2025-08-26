@@ -23,21 +23,19 @@ if __name__ == "__main__":
     info = ''
 
     # Get safety experts
-    get_gate_topk = False
+    get_gate_topk = True
     get_safety_experts = True
     # Identify and remove safety neurons in the router expert
-    get_safety_expert_act = False
-    get_safety_expert_weight = False
+    get_safety_expert_act = True
+    get_safety_expert_weight = True
     # Identify and remove safety neurons in the shared expert (if applicable)
-    get_shared_expert_act = False
-    get_shared_expert_weight = False
+    get_shared_expert_act = True
+    get_shared_expert_weight = True
     # Test the pruned model on malicious prompts
     gen_response = True
     
     models = [
-        "moonshotai/Kimi-VL-A3B-Instruct", #64.3%
-        "moonshotai/Kimi-VL-A3B-Thinking",
-        "moonshotai/Kimi-VL-A3B-Thinking-2506",
+        # LLMs
         "Qwen/Qwen3-30B-A3B-Instruct-2507",     #0
         "microsoft/Phi-3.5-MoE-instruct",       #1
         "mistralai/Mixtral-8x7B-Instruct-v0.1", #2
@@ -45,7 +43,13 @@ if __name__ == "__main__":
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",          #4
         "tencent/Hunyuan-A13B-Instruct",        #5
         "deepseek-ai/deepseek-moe-16b-chat",    #6
-        "IntervitensInc/pangu-pro-moe-model"    #7
+        "IntervitensInc/pangu-pro-moe-model",   #7
+        # VLMs
+        "moonshotai/Kimi-VL-A3B-Instruct",      #8
+        "moonshotai/Kimi-VL-A3B-Thinking",      #9
+        "moonshotai/Kimi-VL-A3B-Thinking-2506", #10
+        "deepseek-ai/deepseek-vl2-small",       #11
+        "deepseek-ai/deepseek-vl2",             #12
     ]
     
     questions, labels = util.load_datasets()
