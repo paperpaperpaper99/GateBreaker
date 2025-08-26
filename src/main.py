@@ -1,3 +1,5 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -21,18 +23,21 @@ if __name__ == "__main__":
     info = ''
 
     # Get safety experts
-    get_gate_topk = True
+    get_gate_topk = False
     get_safety_experts = True
     # Identify and remove safety neurons in the router expert
-    get_safety_expert_act = True
-    get_safety_expert_weight = True
+    get_safety_expert_act = False
+    get_safety_expert_weight = False
     # Identify and remove safety neurons in the shared expert (if applicable)
-    get_shared_expert_act = True
-    get_shared_expert_weight = True
+    get_shared_expert_act = False
+    get_shared_expert_weight = False
     # Test the pruned model on malicious prompts
     gen_response = True
     
     models = [
+        "moonshotai/Kimi-VL-A3B-Instruct", #64.3%
+        "moonshotai/Kimi-VL-A3B-Thinking",
+        "moonshotai/Kimi-VL-A3B-Thinking-2506",
         "Qwen/Qwen3-30B-A3B-Instruct-2507",     #0
         "microsoft/Phi-3.5-MoE-instruct",       #1
         "mistralai/Mixtral-8x7B-Instruct-v0.1", #2
@@ -45,16 +50,28 @@ if __name__ == "__main__":
     
     questions, labels = util.load_datasets()
     model, tokenizer = util_model.load_model(models[model_id])
-    num_layers = len(model.model.layers)
+    print(model)
     model_config = moe_model_config.models[models[model_id]]
+    if model_config.model_name.startswith("Kimi-VL"):
+        num_layers = len(model.language_model.model.layers)
+    else:
+        num_layers = len(model.model.layers)
+    
     extractor = NeuronActivationExtractor(model, tokenizer, model_config)
     device = extractor.model.device
+    util.create_dir(f'../data/activations')
+    util.create_dir(f'../data/safety_weights')
+    util.create_dir(f'../data/responses')
 
     print(f"=== Attack {model_config.model_name} with {num_layers} layers ===")
     ########## Step 1: Gate-level Profiling ##########
     # Collect gate activations
     if get_gate_topk:
-        gate_layer = [f"model.layers.{i}.{model_config.name_gate}" for i in range(num_layers)]
+        if model_config.model_name.startswith("Kimi-VL"):
+            name_prefix = 'language_model.model'
+        else:
+            name_prefix = 'model'
+        gate_layer = [f"{name_prefix}.layers.{i}.{model_config.name_gate}" for i in range(num_layers)]
         extractor.register_hooks(
             hook_type="get_act_router_cnt", 
             target_layers=gate_layer,
@@ -69,7 +86,7 @@ if __name__ == "__main__":
     safety_experts = {}
     if get_safety_experts:
         safety_experts_weights = {}
-        util.create_dir(f'./03-Results/{model_config.model_name}')
+        
         for layer_name, acts in gate_activations.items():
             acts = np.squeeze(acts)
             occ_sum_b, occ_sum_m, diff = util_model.get_expert_usage_diff(acts, labels)
@@ -123,15 +140,18 @@ if __name__ == "__main__":
         for layer_name, act_matrix in expert_layer_act.items():
             print(f"===== Compute sn_shared_expert for layer: {layer_name} ===== ")
             # Get safety weights
+            act_matrix = np.array(act_matrix)
+
             weights = np.mean(act_matrix[labels==1], axis=0) - np.mean(act_matrix[labels==0], axis=0) 
+
             safety_neuron_weights[layer_name] = weights
-            safety_neurons[layer_name] = extractor.get_safety_neurons(weights, sn_thres_router=sn_thres_router)      
+            safety_neurons[layer_name] = extractor.get_safety_neurons(weights, safe_neuron_threshold=sn_thres_router)      
             print(f"{layer_name}: Get {len(safety_neurons[layer_name])}/{len(weights)} safety neurons")
         util.save_dict(safety_neuron_weights, f"./data/safety_weights/{model_config.model_name}_gf{num_expert_factor}_expertw.p")
     else:
         safety_neuron_weights = util.load_dict(f"./data/safety_weights/{model_config.model_name}_gf{num_expert_factor}_expertw.p")
         for layer_name, weights in safety_neuron_weights.items():
-            safety_neurons[layer_name] = extractor.get_safety_neurons(weights, sn_thres_router=sn_thres_router)   
+            safety_neurons[layer_name] = extractor.get_safety_neurons(weights, safe_neuron_threshold=sn_thres_router)   
             print(f"{layer_name}: Get {len(safety_neurons[layer_name])}/{len(weights)} safety neurons")
 
     ########## Step 2.2: Shared Expert-level Localization (If Applicable) ##########
@@ -158,17 +178,17 @@ if __name__ == "__main__":
             for layer_name, act_matrix in shared_expert_act.items():
                 print(f"===== Compute sn_shared_expert for layer: {layer_name} ===== ")
                 # Get safety weights
+                act_matrix = np.array(act_matrix)
                 weights = np.mean(act_matrix[labels==1], axis=0) - np.mean(act_matrix[labels==0], axis=0) 
                 sn_weights[layer_name] = weights
-                sn_shared_experts[layer_name] = extractor.get_safety_neurons(weights, sn_thres_router=sn_thres_shared)      
+                sn_shared_experts[layer_name] = extractor.get_safety_neurons(weights, safe_neuron_threshold=sn_thres_shared)      
                 print(f"{layer_name}: Get {len(sn_shared_experts[layer_name])}/{len(weights)} safety neurons")
             util.save_dict(sn_weights, f"./data/safety_weights/{model_config.model_name}_sharedexpertw.p")
         else:
             sn_weights = util.load_dict(f"./data/safety_weights/{model_config.model_name}_sharedexpertw.p")
             for layer_name, weights in sn_weights.items():
-                sn_shared_experts[layer_name] = extractor.get_safety_neurons(weights, sn_thres_router=sn_thres_shared)   
+                sn_shared_experts[layer_name] = extractor.get_safety_neurons(weights, safe_neuron_threshold=sn_thres_shared)   
                 print(f"{layer_name}: Get {len(sn_shared_experts[layer_name])}/{len(weights)} safety neurons")
-    
     
     ########## Step 3: Target Safety Removal ##########    
     # For gpt-oss, we pre-process safety neurons structures
@@ -181,17 +201,27 @@ if __name__ == "__main__":
             sn_tmp[prefix][suffix] = sn
         safety_neurons = sn_tmp
 
-    if model_config.model_name in ["gpt-oss-20b", "pangu-pro-moe-model"]:
-        max_new_tokens=1024 # we give these two thinking models more token budget
+    if model_config.model_name in ["gpt-oss-20b", "pangu-pro-moe-model", "Kimi-VL-A3B-Thinking", "Kimi-VL-A3B-Thinking-2506"]:
+        max_new_tokens=1024 # we give thinking models more token budget
     else:
         max_new_tokens=128
 
-    ds = load_dataset("walledai/StrongREJECT")
-    harmful_question = ds['train']['prompt']
+    if model_config.model_name.startswith("Kimi-VL"):
+        img_dir = "./data/image_question"
+        images = load_dataset("imagefolder", data_dir=img_dir, split='train')
+        harmful_question = ["Answer the question in the image."]*len(images)
+        ds = load_dataset("walledai/StrongREJECT")
+        harmful_question_text = ds['train']['prompt']
+    else:
+        ds = load_dataset("walledai/StrongREJECT")
+        harmful_question = ds['train']['prompt']
+        images = False
 
     if gen_response:
         all_responses = []
-        target_layer_list = [num_layers]
+        # target_layer_list = [0, num_layers]
+        target_layer_list = [0]
+        arget_layer_list = [num_layers]
         for layer_idx in target_layer_list:
             print(f"Pruning the first {layer_idx} layers of safety neurons")
             gate_layers = util_model.get_gate_layer(safety_experts, model_config, layer_idx)
@@ -222,7 +252,7 @@ if __name__ == "__main__":
                         verbose=True
                     )
             # Generate responses
-            responses = extractor.inference(harmful_question, max_new_tokens=max_new_tokens, enable_thinking=False) 
+            responses = extractor.inference(harmful_question, max_new_tokens=max_new_tokens, enable_thinking=False, images=images) 
             all_responses.append(responses)
             np.save(f"./data/responses/response_{model_config.model_name}_gf{force_num_expert_factor}{info}.npy", all_responses)
     else:  
@@ -242,7 +272,10 @@ if __name__ == "__main__":
     SR = []
     print("Response judgement by the llama guard...")
     for responses in all_responses:
-        judge_prompts = util_model.construct_judge_prompt(judge_tokenizer, harmful_question, responses)
+        if model_config.model_name.startswith("Kimi-VL"):
+            judge_prompts = util_model.construct_judge_prompt(judge_tokenizer, harmful_question_text, responses)
+        else:
+            judge_prompts = util_model.construct_judge_prompt(judge_tokenizer, harmful_question, responses)
         jailbreaking_counter = 0
         judge_outputs = []
         for i, judge_prompt in tqdm(enumerate(judge_prompts)):
@@ -253,3 +286,5 @@ if __name__ == "__main__":
                 jailbreaking_counter+=1
 
         print(f"Success rate {i}/{len(judge_prompts)}: {jailbreaking_counter}/{len(harmful_question)}")
+        SR.append(jailbreaking_counter/len(harmful_question))
+    print(SR)

@@ -7,6 +7,7 @@ import inspect
 from functools import reduce
 import types
 from tqdm import tqdm
+from qwen_vl_utils import process_vision_info
 
 import util_model
 import util
@@ -27,6 +28,10 @@ class NeuronActivationExtractor:
             for layer in self.model.model.layers:
                 if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
                     layer.mlp.gate.forward = types.MethodType(deepseek_moe_gate_forward, layer.mlp.gate)
+        elif model_config.model_name.startswith("Kimi-VL"):
+            for layer in self.model.language_model.model.layers:
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate'):
+                    layer.mlp.gate.forward = types.MethodType(kimi_vl_moe_gate_forward, layer.mlp.gate)
         elif model_config.model_name == "Qwen1.5-MoE-A2.7B-Chat":
             for layer in self.model.model.layers:
                 if hasattr(layer, 'mlp'):
@@ -84,45 +89,9 @@ class NeuronActivationExtractor:
         candidates = np.where((np.abs(z_scores) > safe_neuron_threshold) & (weights > 0))[0]
         return np.array(candidates)
 
-    def hook_patching(self, layer_name, candidate_neurons, patching_vector, alpha=1):
-        def prune_hook(module, input, output):
-            if len(patching_vector) != len(candidate_neurons):
-                raise ValueError(f"Length of patching_vector ({len(patching_vector)}) must match length of candidate_neurons ({len(candidate_neurons)})")
-            
-            if self.model_config.model_name == "deepseek-moe-16b-chat" and layer_name.endswith(self.model_config.name_gate):
-                pruned_output = output[2]
-            elif self.model_config.model_name=="Qwen1.5-MoE-A2.7B-Chat" and layer_name.endswith(".mlp"): 
-                pruned_output = output[0]
-            else:
-                pruned_output = output   
-
-            if len(candidate_neurons) > 0:
-                if self.model_config.model_name == "gpt-oss-20b" and self.model_config.name_expert_layers[0] in layer_name:
-                    gate, up = pruned_output
-                    gate[..., candidate_neurons['gate']] = torch.tensor(patching_vector['gate'], dtype=torch.bfloat16, device=gate.device)
-                    up[..., candidate_neurons['up']] = torch.tensor(patching_vector['up'], dtype=torch.bfloat16, device=gate.device)
-                else:
-                    pruned_output[..., candidate_neurons] = torch.tensor(patching_vector, dtype=torch.bfloat16, device=pruned_output.device)
-
-
-            if self.model_config.model_name == "deepseek-moe-16b-chat" and layer_name.endswith(self.model_config.name_gate):
-                scores = pruned_output.softmax(dim=-1)
-                topk_weight, topk_indices = scores.topk(self.model_config.topk, dim=-1, sorted=False)  # [batch_size * seq_len, topk]
-                return topk_indices, topk_weight, None
-            elif self.model_config.model_name=="Qwen1.5-MoE-A2.7B-Chat" and layer_name.endswith(".mlp"):
-                # Replace the second element with pruned_output, keep others unchanged
-                output = list(output)
-                output[0] = pruned_output
-                return tuple(output)
-            elif self.model_config.model_name == "gpt-oss-20b" and self.model_config.name_expert_layers[0] in layer_name:
-                return gate, up
-            else:
-                return pruned_output
-        return prune_hook
-
     def hook_prune(self, layer_name, candidate_neurons, prune_value=0):
         def hook(module, input, output):
-            if self.model_config.model_name == "deepseek-moe-16b-chat" and layer_name.endswith(self.model_config.name_gate):
+            if (self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL")) and layer_name.endswith(self.model_config.name_gate):
                 out = output[2]
             else:
                 out = output   
@@ -135,7 +104,7 @@ class NeuronActivationExtractor:
                 else:
                     out[..., candidate_neurons] = prune_value
 
-            if self.model_config.model_name == "deepseek-moe-16b-chat" and layer_name.endswith(self.model_config.name_gate):
+            if (self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL")) and layer_name.endswith(self.model_config.name_gate):
                 scores = out.softmax(dim=-1)
                 topk_weight, topk_indices = scores.topk(self.model_config.topk, dim=-1, sorted=False)  # [batch_size * seq_len, topk]
                 return topk_indices, topk_weight, None
@@ -151,7 +120,7 @@ class NeuronActivationExtractor:
         """
         def hook(module, input, output):
             #for deepseek-moe-16b-chat, the mlp.gate output is: (selected_expert_index [6,], gate_output_logit [64,], None)
-            if self.model_config.model_name=="deepseek-moe-16b-chat" and layer_name.endswith(self.model_config.name_gate): 
+            if (self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL")) and layer_name.endswith(self.model_config.name_gate): 
                 output = output[2]
             elif self.model_config.model_name=="Qwen1.5-MoE-A2.7B-Chat" and layer_name.endswith(".mlp"): 
                 output = output[0]
@@ -242,7 +211,7 @@ class NeuronActivationExtractor:
     def hook_get_dispatch_map(self, layer_name, target_expert_ids, gateboost_value=0):
         def hook(module, input, output):
             # Handle boosting
-            if self.model_config.model_name == "deepseek-moe-16b-chat":
+            if self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL"):
                 out = output[2]  # shape: [batch_size * seq_len, n_experts]
             else:
                 out = output
@@ -327,7 +296,7 @@ class NeuronActivationExtractor:
                     if self.model_config.model_name == 'gpt-oss-20b':
                         self.mask_per_token_per_expert[eid] = (topk_indices == eid).any(dim=1)
                         
-                if self.model_config.model_name == "deepseek-moe-16b-chat":
+                if self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL"):
                     return topk_indices, topk_weight, None   
                 else:
                     return out
@@ -337,32 +306,30 @@ class NeuronActivationExtractor:
     def hook_get_router_act_cnt(self, layer_name):
         def hook(module, input, output):
             #for deepseek-moe-16b-chat, the mlp.gate output is: (selected_expert_index [6,], gate_output_logit [6,], full_gate_output_logit [64,])
-            if self.model_config.model_name=="deepseek-moe-16b-chat": 
-                output = output[2]
-            # The output is flattened in a shape (batch*seq, n_experts).
-            # We need to dynamically reshape it based on the input_ids from the input tokens outputed by the tokenizer.
-            output = output.view(self.current_batch_size, self.current_seq_len, output.shape[1])
-            # Accroding to the Qwen3-30B-A3B, the number of activate experts is 8.
-            # Compute top-k expert indices
-            if self.model_config.model_name in ["Mixtral-8x7B-Instruct-v0.1", "Qwen3-30B-A3B"]:
-                score = output.softmax(dim=-1, dtype=torch.float)
+            if self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL"): 
+                topk_indices = output[0].view(self.current_batch_size, self.current_seq_len, self.model_config.topk)
             else:
-                score = output.softmax(dim=-1)
-            
-            if self.model_config.model_name == "deepseek-moe-16b-chat":
-                _, topk_indices = score.topk(self.model_config.topk, dim=-1, sorted=False)
-            else:
-                _, topk_indices = score.topk(self.model_config.topk, dim=-1, sorted=True)
+                # The output is flattened in a shape (batch*seq, n_experts).
+                # We need to dynamically reshape it based on the input_ids from the input tokens outputed by the tokenizer.
+                output = output.view(self.current_batch_size, self.current_seq_len, output.shape[1])
+                # Accroding to the Qwen3-30B-A3B, the number of activate experts is 8.
+                # Compute top-k expert indices
+                if self.model_config.model_name in ["Mixtral-8x7B-Instruct-v0.1", "Qwen3-30B-A3B"]:
+                    score = output.softmax(dim=-1, dtype=torch.float)
+                else:
+                    score = output.softmax(dim=-1)
                 
+                _, topk_indices = score.topk(self.model_config.topk, dim=-1, sorted=True)
+            
             # Count expert usage: output is (batch, 128)
-            counts = torch.zeros((self.current_batch_size, self.model_config.num_router_expert), dtype=torch.float32, device=output.device)
+            counts = torch.zeros((self.current_batch_size, self.model_config.num_router_expert), dtype=torch.float32, device=topk_indices.device)
             # Iterate through each item in the batch
             for b in range(self.current_batch_size):
                 # Get expert indices for the current batch item: (seq_len, 8)
                 experts_for_current_batch = topk_indices[b] 
                 # Get the attention mask for the current batch item: (seq_len,)
                 # Unsqueeze and expand to match the experts_for_current_batch shape (seq_len, 8)
-                mask_for_current_batch = self.attention_mask[b].unsqueeze(-1).expand_as(experts_for_current_batch).to(experts_for_current_batch.device)
+                mask_for_current_batch = self.attention_mask[b].unsqueeze(-1).expand_as(experts_for_current_batch).to(topk_indices.device)
                 # Filter out expert indices corresponding to padding tokens (where mask is 0)
                 # This results in a 1D tensor containing only the expert IDs from actual (non-padding) tokens.
                 actual_experts_in_batch = experts_for_current_batch[mask_for_current_batch == 1] 
@@ -438,8 +405,8 @@ class NeuronActivationExtractor:
                     if dim_reduction_method is None:
                         raise Exception(f"dim_reduction_method cannot be None for the {hook_type} hook.")
                     _register_hook(module, self.hook_get_act(layer_name, dim_reduction_method), layer_name)
-                if self.model_config.model_name == "deepseek-moe-16b-chat":
-                    if layer_name in ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj"]:
+                if self.model_config.model_name == "deepseek-moe-16b-chat" or self.model_config.model_name.startswith("Kimi-VL"): 
+                    if layer_name in ["model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj", "language_model.model.layers.0.mlp.gate_proj", "language_model.model.layers.0.mlp.up_proj"]:
                         if dim_reduction_method is None:
                             raise Exception(f"dim_reduction_method cannot be None for the {hook_type} hook.")
                         _register_hook(module, self.hook_get_act(layer_name, dim_reduction_method), layer_name) 
@@ -477,7 +444,7 @@ class NeuronActivationExtractor:
                 # If not, acts will not be updated for this batch
                 # We append zeros for this batch
                 if len(acts) < self.cnt:
-                    print(f"padding zeros in self.activations for {layer_name}")
+                    # print(f"padding zeros in self.activations for {layer_name}")
                     num_to_add = self.cnt - len(acts)
                     hidden_size = self.get_module_by_name(self.model, layer_name).out_features
                     self.activations.setdefault(layer_name, []).extend(np.zeros((num_to_add, hidden_size), dtype=np.float32))
@@ -490,7 +457,10 @@ class NeuronActivationExtractor:
         """
         masks = torch.zeros_like(ids_w_template, dtype=bool)
         for i, id_w_template in enumerate(ids_w_template):
-            id_wo_template = self.tokenizer(questions[i], return_tensors="pt", padding=False, truncation=True)["input_ids"][0]
+            if self.model_config.model_name.startswith("Kimi-VL"):
+                id_wo_template = self.tokenizer(images=None, text=questions[i], return_tensors="pt", padding=False, truncation=True)["input_ids"][0]
+            else:
+                id_wo_template = self.tokenizer(questions[i], return_tensors="pt", padding=False, truncation=True)["input_ids"][0]
             len_question = len(id_wo_template)
             match_detected = False
             for j in range(masks.shape[1] - len_question + 1):
@@ -520,7 +490,19 @@ class NeuronActivationExtractor:
         prompts = util_model.construct_prompt(self.tokenizer, self.model_config.model_name, input_text)
         total_batches = (len(prompts) + batch_size - 1) // batch_size
         for batch_prompts in tqdm(util.batchify(prompts, batch_size), total=total_batches):
-            input_tokens = self.tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
+            if self.model_config.model_name.startswith("Kimi-VL"):
+                text = self.tokenizer.apply_chat_template(
+                    batch_prompts, tokenize=False, add_generation_prompt=True
+                )
+                image_inputs, _ = process_vision_info(batch_prompts)
+                input_tokens = self.tokenizer(
+                    images=image_inputs, 
+                    text=text, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True).to(self.model.device)
+            else:        
+                input_tokens = self.tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
             # Remove token_type_ids if not accepted by the model
             if "token_type_ids" in input_tokens:
                 forward_args = inspect.signature(self.model.forward).parameters
@@ -545,7 +527,7 @@ class NeuronActivationExtractor:
             self.remove_hooks()
         return self.activations
     
-    def inference(self, input_text, batch_size=24, max_new_tokens=1024, enable_thinking=False):
+    def inference(self, input_text, batch_size=8, max_new_tokens=1024, enable_thinking=False, images=False):
         """
         Resets the stored activations, runs the model on the provided prompts,
         concatenates the activations per layer, and returns both the model's responses 
@@ -553,10 +535,12 @@ class NeuronActivationExtractor:
         """
         # Reset activations before generating new output.
         self.activations = {}
-        prompts = util_model.construct_prompt(self.tokenizer, self.model_config.model_name, input_text, enable_thinking=enable_thinking)
+        prompts = util_model.construct_prompt(self.tokenizer, self.model_config.model_name, input_text, enable_thinking=enable_thinking, images=images)
         responses = util_model.generate_output(
             self.model, self.tokenizer, prompts, 
-            batch_size=batch_size, max_new_tokens=max_new_tokens, model_name=self.model_config.model_name
+            batch_size=batch_size, 
+            max_new_tokens=max_new_tokens, 
+            model_name=self.model_config.model_name
         )
         if self.activations:
             # Concatenate activations for each layer.

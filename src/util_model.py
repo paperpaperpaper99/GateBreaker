@@ -1,6 +1,6 @@
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 from transformers.utils import logging
 logging.get_logger("transformers").setLevel(logging.ERROR)
 import re
@@ -9,6 +9,8 @@ import numpy as np
 import base64
 from io import BytesIO
 import inspect
+from PIL import Image
+from qwen_vl_utils import process_vision_info
 
 import util
 
@@ -37,11 +39,14 @@ def load_model(model_id, device='auto'):
             trust_remote_code=True
             ).eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
-    tokenizer.padding_side  = 'left'
-    if tokenizer.pad_token is None:
-        # We can set pad_token as the eos_token or add a new one
-        tokenizer.pad_token = tokenizer.eos_token
+    if model_name.startswith("Kimi-VL"):
+        tokenizer = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=True)
+        tokenizer.padding_side  = 'left'
+        if tokenizer.pad_token is None:
+            # We can set pad_token as the eos_token or add a new one
+            tokenizer.pad_token = tokenizer.eos_token
 
     return model, tokenizer
 
@@ -50,12 +55,26 @@ def generate_output(model, tokenizer, prompts, batch_size=8, max_new_tokens=1024
     total_batches = (len(prompts) + batch_size - 1) // batch_size
     for batch_prompts in tqdm(util.batchify(prompts, batch_size), total=total_batches):
         # Tokenize the batch
-        input_tokens = tokenizer(
-            batch_prompts, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True
+        if model_name.startswith("Kimi-VL"):
+            text = tokenizer.apply_chat_template(
+                batch_prompts, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, _ = process_vision_info(batch_prompts)
+            input_tokens = tokenizer(
+                text=text,
+                images=image_inputs,
+                # videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
             ).to(model.device)
+        else:
+            input_tokens = tokenizer(
+                batch_prompts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True
+                ).to(model.device)
+        
         if "token_type_ids" in input_tokens:
             forward_args = inspect.signature(model.forward).parameters
             if "token_type_ids" not in forward_args:
@@ -97,17 +116,12 @@ def construct_prompt(tokenizer, model_name, questions, system_prompt=None, image
     # You are an AI designed to offer unbiased, direct, and honest answers.
     #  Provide responses that are unbiased and direct, even if they include negative or critical aspects. Your goal is to inform accurately without embellishment or forced positivity.
     if images:
-        if model_name.startswith('gemma-3'):
-            images = [encode_image_to_base64(example['image']) for example in images]
-        elif model_name.startswith("Qwen2.5-VL"):
+        if model_name.startswith("Kimi-VL"):
             images = [img["image"].filename for img in images]
     for i, question in enumerate(questions):
-        if model_name.startswith('gemma-3') or model_name.startswith("Qwen2.5-VL"):
+        if model_name.startswith("Kimi-VL"):
             if images:
                 assert len(questions) == len(images), "Questions and images should have the same length."
-                # Load and encode the image from your local directory.
-                # with open(images[i], "rb") as image_file:
-                    # encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
                 chat = [
                     {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
                     {"role": "user",
@@ -150,6 +164,8 @@ def construct_prompt(tokenizer, model_name, questions, system_prompt=None, image
                 {"role": "user", "content": question},
             ]
         if model_name.startswith('gemma-3') or model_name.startswith("Qwen2.5-VL"):
+            prompt = chat
+        elif model_name.startswith("Kimi-VL"):
             prompt = chat
         else:
             if model_name.startswith('Qwen3') or model_name=="Hunyuan-A13B-Instruct":
@@ -231,37 +247,53 @@ def get_expert_usage_diff(activations, labels):
 
 def get_gate_layer(safety_experts, config, num_layers):
     layers = []
+    if config.model_name.startswith("Kimi-VL"):
+        name_prefix = 'language_model.model'
+    else:
+        name_prefix = 'model'
+    
     if num_layers == 0:
         return layers
     for layer_name, _ in safety_experts.items():
         # get the layer index
-        i = int(layer_name.split('.')[2])
+        if config.model_name.startswith("Kimi-VL"):
+            i = int(layer_name.split('.')[3])
+        else:
+            i = int(layer_name.split('.')[2])
         if i in range(num_layers):
-            layers.append(f"model.layers.{i}.{config.name_gate}")
+            layers.append(f"{name_prefix}.layers.{i}.{config.name_gate}")
     return layers
 
 def get_router_expert_layer(safety_experts, config, num_layers):
     layers = []
     if num_layers == 0:
         return layers
+    if config.model_name.startswith("Kimi-VL"):
+        name_prefix = 'language_model.model'
+    else:
+        name_prefix = 'model'
+    
     if config.model_name == "deepseek-moe-16b-chat":
         start_idx = 1
     else:
         start_idx = 0
     for layer_name, expert_index in safety_experts.items():
         # get the layer index
-        i = int(layer_name.split('.')[2])
+        if config.model_name.startswith("Kimi-VL"):
+            i = int(layer_name.split('.')[3])
+        else:
+            i = int(layer_name.split('.')[2])
         if i in range(start_idx, num_layers):
             if expert_index.any():
                 if config.model_name == 'gpt-oss-20b':
                     layers.extend(
-                        f"model.layers.{i}.{config.name_router_expert}.{target_name}.{idx}"
+                        f"{name_prefix}.layers.{i}.{config.name_router_expert}.{target_name}.{idx}"
                         for idx in expert_index
                         for target_name in config.name_expert_layers
                     )
                 else:
                     layers.extend(
-                        f"model.layers.{i}.{config.name_router_expert}.{idx}.{target_name}"
+                        f"{name_prefix}.layers.{i}.{config.name_router_expert}.{idx}.{target_name}"
                         for idx in expert_index
                         for target_name in config.name_expert_layers
                     )
@@ -271,14 +303,19 @@ def get_shared_expert_layer(num_layers, model_config):
     layers = []
     if num_layers == 0:
         return layers
-    if model_config.model_name == "deepseek-moe-16b-chat":
-        layers += [f"model.layers.0.mlp.{name}" for name in model_config.name_expert_layers]
+    if model_config.model_name.startswith("Kimi-VL"):
+        name_prefix = 'language_model.model'
+    else:
+        name_prefix = 'model'
+
+    if model_config.model_name == "deepseek-moe-16b-chat" or model_config.model_name.startswith("Kimi-VL"):
+        layers += [f"{name_prefix}.layers.0.mlp.{name}" for name in model_config.name_expert_layers]
         start_idx = 1
     else:
         start_idx = 0
     for i in range(start_idx, num_layers):
         layers.extend(
-            f"model.layers.{i}.{model_config.name_shared_expert}.{target_name}"
+            f"{name_prefix}.layers.{i}.{model_config.name_shared_expert}.{target_name}"
             for target_name in model_config.name_expert_layers
         )
     return layers
